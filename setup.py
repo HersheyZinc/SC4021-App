@@ -2,7 +2,7 @@ import chromadb, json
 from tqdm import tqdm
 
 
-if __name__ == "__main__":
+def main():
     data_path = "data/stocks_labelled.json"
     database_path = "chromadb"
     batch_size = 10

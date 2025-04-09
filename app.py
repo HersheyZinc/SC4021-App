@@ -1,5 +1,9 @@
 import streamlit as st
-import utils
+import utils, os, setup
+
+if not os.path.exists("chromadb"):
+    setup.main()
+
 
 if "results" not in st.session_state:
     st.session_state["results"] = []

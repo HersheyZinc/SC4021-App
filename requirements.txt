@@ -2,3 +2,5 @@ streamlit
 pysolr
 plotly
 dotenv
+chromadb
+yfinance

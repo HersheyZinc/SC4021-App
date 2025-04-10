@@ -1,96 +1,97 @@
 import plotly.express as px
 import plotly.graph_objects as go
-import chromadb
-from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
-import yfinance as yf
 import pandas as pd
-import os
+import yfinance as yf
+import pysolr, os
+from dotenv import load_dotenv
+import streamlit as st
 
 load_dotenv(override=True)
 
-chroma_client = chromadb.PersistentClient(path="chromadb")
+SOLR_ADDRESS = os.getenv('SOLR_ADDRESS')
+if not SOLR_ADDRESS:
+    raise EnvironmentError("FATAL ERROR: SOLR_ADDRESS environment variable not set. Please configure .env file.")
+try:
+    SOLR = pysolr.Solr(SOLR_ADDRESS, timeout=10)
+    SOLR.ping()
+except Exception as e:
+    raise ConnectionError(f"FATAL ERROR: Could not connect to Solr at {SOLR_ADDRESS}. Error: {e}")
 
-collection_posts = chroma_client.get_collection(name="posts")
-collection_comments = chroma_client.get_collection(name="comments")
 
 
-def plot_sentiment_pie_chart(bullish_count, neutral_count, bearish_count):
-    values = []
-    labels = []
-    colors = []
-
-    if bullish_count:
-        values.append(bullish_count)
-        colors.append("green")
-        labels.append("bullish")
-
-    if neutral_count:
-        values.append(neutral_count)
-        colors.append("gray")
-        labels.append("neutral")
-
-    if bearish_count:
-        values.append(bearish_count)
-        colors.append("red")
-        labels.append("bearish")
-
-    if not values:
+def plot_sentiment_pie_chart(query_results, start_year, end_year):
+    '''
+    Displays sentiment counts as a pie chart
+    '''
+    if len(query_results) == 0:
         values, labels, colors = [1], ["No sentiments"], ["gray"]
+    else:
+        df_sentiments = pd.DataFrame(query_results)
 
-    fig = px.pie(values=values, names=labels, color_discrete_sequence=colors)
+        # Filter the DataFrame to include only rows within the specified time frame
+        df_filtered = df_sentiments[(df_sentiments['year'] >= start_year) & (df_sentiments['year'] <= end_year)]
+
+        # Calculate total sentiment counts within the time frame
+        bullish_count = df_filtered['bullish_count'].sum()
+        neutral_count = df_filtered['neutral_count'].sum()
+        bearish_count = df_filtered['bearish_count'].sum()
+
+        # Prepare data for the pie chart
+        values = [bullish_count, neutral_count, bearish_count]
+        labels = ['Bullish', 'Neutral', 'Bearish']
+        colors = ['green', 'gray', 'red']
+
+    # Create the pie chart using Plotly
+    fig = px.pie(values=values, names=labels, color_discrete_sequence=colors,)
 
     return fig
 
 
 def plot_stock_sentiment_chart(query_results, stock_name, start_year, end_year):
+    '''
+    Function to overlay stock sentiments over stock price.
+    '''
     # Create a DataFrame from the results
     df_sentiments = pd.DataFrame(query_results)
 
-    # Convert the 'date' column to datetime
-    df_sentiments['date'] = pd.to_datetime(df_sentiments['date'])
+    df_sentiments['Year-Month'] = df_sentiments['year'].astype(str) + '-' + df_sentiments['month'].astype(str).str.zfill(2)
 
-    # Extract the month from the 'date' column
-    df_sentiments['Month'] = df_sentiments['date'].dt.to_period('M')
-
-    # Group by 'Month' and calculate the sum of 'bearish_count', 'bullish_count', and 'neutral_count'
-    df_sentiments = df_sentiments.groupby('Month')[['bearish_count', 'bullish_count', 'neutral_count']].sum().reset_index()
-
+    # Group by 'Year-Month' and calculate the sum of sentiments in each month
+    df_sentiments = df_sentiments.groupby('Year-Month')[['bearish_count', 'bullish_count', 'neutral_count']].sum().reset_index()
 
     # Normalize the sentiment counts so each row adds up to 1
     df_sentiments[['bearish_count', 'bullish_count']] = df_sentiments[['bearish_count', 'bullish_count']].div(
-        df_sentiments[['bearish_count', 'bullish_count']].sum(axis=1), axis=0)
+    df_sentiments[['bearish_count', 'bullish_count']].sum(axis=1), axis=0)
+    df_sentiments['Bullish-Bearish'] = df_sentiments['bullish_count'] - df_sentiments['bearish_count']
 
+    # Handle historical stock data
     if not stock_name:
         df_merged = df_sentiments
         df_merged['Close'] = 0
     else:
+        # Download historical stock data from Yahoo Finance
         df_stockprices = yf.download(stock_name, start=f"{start_year}-01-01", end=f"{end_year+1}-01-01")
         if df_stockprices.empty:
             df_merged = df_sentiments
             df_merged['Close'] = 0
         else:
+            # Format data by month and get the monthly Close price of the stock
             df_stockprices.index = pd.to_datetime(df_stockprices.index)
             df_stockprices.columns = df_stockprices.columns.droplevel(1)
             df_stockprices.reset_index(inplace=True)
-            df_stockprices['Month'] = df_stockprices['Date'].dt.to_period('M')
-            df_stockprices = df_stockprices[['Month', 'Close']]
+            df_stockprices['Year-Month'] = df_stockprices['Date'].dt.to_period('M').astype(str)
+            df_stockprices = df_stockprices[['Year-Month', 'Close']]
 
-            df_merged = df_stockprices.merge(df_sentiments, on='Month', how='left')
+            df_merged = df_stockprices.merge(df_sentiments, on='Year-Month', how='left')
             df_merged.fillna(0, inplace=True)
         
-    df_merged['Month'] = df_merged['Month'].astype(str)
-    
-
-    # Calculate the difference between bullish and bearish counts
-    df_merged['Bullish-Bearish'] = df_merged['bullish_count'] - df_merged['bearish_count']
 
     # Create a diverging bar chart using Plotly
     fig = go.Figure()
 
     # Add bullish bars
     fig.add_trace(go.Bar(
-        x=df_merged.loc[df_merged["Bullish-Bearish"] > 0, 'Month'],
+        x=df_merged.loc[df_merged["Bullish-Bearish"] > 0, 'Year-Month'],
         y=df_merged.loc[df_merged["Bullish-Bearish"] > 0, "Bullish-Bearish"] * 3,
         name='Bullish',
         marker_color='green'
@@ -98,7 +99,7 @@ def plot_stock_sentiment_chart(query_results, stock_name, start_year, end_year):
 
     # Add bearish bars
     fig.add_trace(go.Bar(
-        x=df_merged.loc[df_merged["Bullish-Bearish"] < 0, 'Month'],
+        x=df_merged.loc[df_merged["Bullish-Bearish"] < 0, 'Year-Month'],
         y=df_merged.loc[df_merged["Bullish-Bearish"] < 0, "Bullish-Bearish"] * 3,
         name='Bearish',
         marker_color='red'
@@ -106,7 +107,7 @@ def plot_stock_sentiment_chart(query_results, stock_name, start_year, end_year):
 
     # Overlay stock prices as a line chart
     fig.add_trace(go.Scatter(
-        x=df_merged['Month'],
+        x=df_merged['Year-Month'],
         y=df_merged['Close'],
         name='Stock Price',
         mode='lines',
@@ -115,7 +116,7 @@ def plot_stock_sentiment_chart(query_results, stock_name, start_year, end_year):
 
     # Update layout for better visualization
     fig.update_layout(
-        xaxis_title='Month',
+        xaxis_title='Year-Month',
         yaxis_title=f'Stock Price ({stock_name})',
         barmode='relative',
         xaxis_tickangle=45,
@@ -125,30 +126,33 @@ def plot_stock_sentiment_chart(query_results, stock_name, start_year, end_year):
             side='right'
         )
     )
-
     return fig
 
 
-def query_posts(query, top_k=100):
-    response = collection_posts.query(
-    query_texts=[query], 
-    n_results= top_k
-    )
-    results = response["metadatas"][0]
 
-    for post in results:
-        comment_ids = post["comment_ids"].split(",")
-        comments = collection_comments.get(comment_ids)["metadatas"]
-        post["comments"] = comments
+def query_posts(query:str, start_date:str=None, end_date:str=None, sort=None, top_k:int=10000):
+    q = f"title:{query} OR text:{query}"
+    from datetime import datetime, time
+
+
+    filters = []
+    # Convert start_date and end_date from year to '%Y-%m-%dT%H:%M:%SZ' format
+    if start_date and end_date:
+        solr_start_date = f"{start_date}-01-01T00:00:00Z"
+        solr_end_date = f"{end_date}-12-31T23:59:59Z"
+
+        filters.append(f"date:[{solr_start_date} TO {solr_end_date}]")
+    
+
+    # Execute the search
+    results = SOLR.search(q, rows=top_k, fq=filters)
+
+
+
+    for result in results:
+        for key in result.keys():
+            if key not in ("comment_texts", "comment_sentiments", "comment_scores", "tickers"):
+                if isinstance(result[key], list) and len(result[key]) == 1:
+                    result[key] = result[key][0]
 
     return results
-
-
-def sort_posts(post_results, sort_by:str, ascending=False):
-    if sort_by not in post_results[0]:
-        return False
-    
-    post_results.sort(key=lambda post: post[sort_by], reverse=not ascending)
-
-    return True
-
